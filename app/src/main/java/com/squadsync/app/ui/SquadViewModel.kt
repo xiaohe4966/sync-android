@@ -14,25 +14,28 @@ import com.squadsync.app.net.MasterClient
 import com.squadsync.app.net.NsdController
 import com.squadsync.app.net.Protocol
 import com.squadsync.app.net.RelayClient
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
  * Single source of truth for the UI.
  *
- * - Holds a map of `Peer` keyed by `host:port`.
- * - Spawns / tears down a `MasterClient` per peer as connections come and go.
+ * - Holds a map of `Peer` keyed by `host:port` (LAN) or `relay:<name>` (relay).
+ * - Spawns / tears down a `MasterClient` per LAN peer as connections come and go.
+ * - Relay peers are managed entirely through the relay inbound stream.
  */
 class SquadViewModel(app: Application) : AndroidViewModel(app) {
 
     private val nsd = NsdController(app)
     private val audio = MediaCommander(app)
 
-    // Optional remote relay. Set via [setRelayUrl] when the user fills in the
-    // "转发服务器 URL" field. When null the app behaves exactly as before
-    // (LAN-only via mDNS).
+    // Optional remote relay.
     private var relay: RelayClient? = null
+    private var relayStatePumpJob: Job? = null
 
     /** Public state for the UI to show a "已连接服务器" badge. */
     private val _relayConnected = MutableStateFlow(false)
@@ -51,23 +54,16 @@ class SquadViewModel(app: Application) : AndroidViewModel(app) {
             nsd.peers.collect { discovered ->
                 val current = _peers.value
                 val merged = current.toMutableMap()
-                // Local IP set, refreshed occasionally so we recognise
-                // ourselves even if our address changes (DHCP / VPN).
                 val myIps = localIps()
                 for ((name, dp) in discovered) {
                     val key = "${dp.host}:${dp.port}"
-                    if (dp.host in myIps) {
-                        // mDNS on Android routinely reports our own service
-                        // back to us. Skip it so we don't open a loopback
-                        // WebSocket to ourselves.
-                        continue
-                    }
+                    if (dp.host in myIps) continue
                     val prev = merged[key]
                     merged[key] = (prev ?: Peer(
                         id = key, host = dp.host, port = dp.port, name = dp.name
                     )).copy(name = dp.name, lastSeenMs = System.currentTimeMillis())
                 }
-                // Drop stale peers older than 30 s (NSD doesn't always emit "lost").
+                // Drop stale peers older than 30 s.
                 val cutoff = System.currentTimeMillis() - 30_000
                 for ((k, p) in merged.toMap()) {
                     if (p.lastSeenMs < cutoff && !clients.containsKey(k)) {
@@ -98,45 +94,182 @@ class SquadViewModel(app: Application) : AndroidViewModel(app) {
     fun stopDiscovery() = nsd.stopDiscovery()
 
     /**
-     * Apply a new relay URL. Empty string disables the relay and tears
-     * down the existing connection. Any non-empty value (with or without
-     * `ws://` prefix) triggers a reconnect.
+     * Apply a new relay URL. Empty string disables the relay.
      */
     fun setRelayUrl(url: String) {
         AppPrefs.relayUrl = url.trim()
         relay?.stop()
         relay = null
+        relayStatePumpJob?.cancel()
+        relayStatePumpJob = null
         _relayConnected.value = false
+        markRelayPeersOffline()
         if (url.isBlank()) return
         val client = RelayClient(url.trim()).also { it.start() }
         relay = client
         viewModelScope.launch {
             client.connected.collect { ok ->
                 _relayConnected.value = ok
-                if (ok) EventLog.info("relay: ${url.trim()}")
-                else EventLog.info("relay: disconnected")
+                if (ok) {
+                    EventLog.info("relay: ${url.trim()}")
+                    sendRelayHello()
+                    startRelayStatePump()
+                } else {
+                    EventLog.info("relay: disconnected")
+                    relayStatePumpJob?.cancel()
+                    relayStatePumpJob = null
+                    markRelayPeersOffline()
+                }
             }
         }
-        // Bridge the inbound text stream into the EventLog too, so the user
-        // can see relay traffic right next to LAN traffic.
+        // Inbound stream: parse real messages, log the rest.
         viewModelScope.launch {
             client.events.collect { line ->
-                EventLog.send(line.removePrefix("→").trim())
+                if (line.startsWith("← ")) {
+                    handleRelayInbound(line.removePrefix("← ").trim())
+                } else {
+                    EventLog.send(line.removePrefix("→").trim())
+                }
             }
         }
     }
 
-    /** Force a reconnect of the relay (e.g. after server URL edit). */
     fun reconnectRelay() = setRelayUrl(AppPrefs.relayUrl)
-
-    /** True if the user has configured a non-empty relay URL. */
     fun hasRelay(): Boolean = AppPrefs.relayUrl.isNotBlank()
 
+    // -------- Relay inbound handling --------
+
+    private fun handleRelayInbound(text: String) {
+        val msg = Protocol.decode(text) ?: return
+        when (msg) {
+            is Wire.Hello -> handleRelayHello(msg)
+            is Wire.State -> handleRelayState(msg)
+            is Wire.Cmd -> handleRelayCmd(msg)
+            is Wire.Ack -> EventLog.send("relay ack: ${msg.action} ok=${msg.ok}")
+            is Wire.AppsList -> { /* apps list needs a sender context; ignored for now */ }
+            is Wire.Ping -> relay?.send(Protocol.encode(Wire.Pong()))
+            is Wire.Pong -> { /* heartbeat */ }
+            is Wire.ErrorMsg -> EventLog.send("relay err: ${msg.message}")
+        }
+    }
+
+    private fun handleRelayHello(hello: Wire.Hello) {
+        if (hello.deviceName == AppPrefs.deviceName) return
+        if (hello.roomCode != AppPrefs.roomCode) return
+        val key = RELAY_PEER_PREFIX + hello.deviceName
+        val peers = _peers.value.toMutableMap()
+        val existing = peers[key]
+        peers[key] = (existing ?: Peer(
+            id = key, host = "relay", port = 0, name = hello.deviceName
+        )).copy(
+            name = hello.deviceName,
+            role = hello.role,
+            online = true,
+            lastSeenMs = System.currentTimeMillis()
+        )
+        _peers.value = peers
+        EventLog.info("relay peer joined: ${hello.deviceName}")
+    }
+
+    private fun handleRelayState(state: Wire.State) {
+        if (state.deviceName == AppPrefs.deviceName) return
+        val key = RELAY_PEER_PREFIX + state.deviceName
+        val peers = _peers.value.toMutableMap()
+        val existing = peers[key]
+        if (existing == null) {
+            peers[key] = Peer(
+                id = key, host = "relay", port = 0, name = state.deviceName,
+                online = true, volume = state.volume, maxVolume = state.maxVolume,
+                brightness = state.brightness, lastSeenMs = System.currentTimeMillis()
+            )
+        } else {
+            peers[key] = existing.copy(
+                volume = state.volume,
+                maxVolume = state.maxVolume,
+                brightness = state.brightness,
+                online = true,
+                lastSeenMs = System.currentTimeMillis()
+            )
+        }
+        _peers.value = peers
+    }
+
+    private fun handleRelayCmd(cmd: Wire.Cmd) {
+        if (cmd.sender == AppPrefs.deviceName) return
+        EventLog.send("relay cmd: ${cmd.action} ${cmd.value ?: ""}")
+        when (cmd.action) {
+            Actions.VOLUME -> audio.setVolume(cmd.value ?: 0)
+            Actions.VOLUME_PERCENT -> audio.setVolumePercent(cmd.value ?: 0)
+            Actions.VOLUME_UP -> audio.adjust(1)
+            Actions.VOLUME_DOWN -> audio.adjust(-1)
+            Actions.BRIGHTNESS_PERCENT -> {
+                if (audio.hasBrightnessWritePermission()) audio.setBrightnessPercent(cmd.value ?: 0)
+            }
+            Actions.LAUNCH_APP -> cmd.target?.let { audio.launchApp(it) }
+            Actions.LIST_APPS -> { /* master-only request; ignore on slave */ }
+            Actions.PLAY -> audio.play()
+            Actions.PAUSE -> audio.pause()
+            Actions.TOGGLE -> audio.toggle()
+            Actions.NEXT -> audio.next()
+            Actions.PREVIOUS -> audio.previous()
+            Actions.MUTE -> audio.mute(true)
+            Actions.UNMUTE -> audio.mute(false)
+        }
+    }
+
+    private fun markRelayPeersOffline() {
+        val peers = _peers.value.toMutableMap()
+        var changed = false
+        for ((k, p) in peers) {
+            if (k.startsWith(RELAY_PEER_PREFIX) && p.online) {
+                peers[k] = p.copy(online = false)
+                changed = true
+            }
+        }
+        if (changed) _peers.value = peers
+    }
+
+    // -------- Relay outbound helpers --------
+
+    private fun sendRelayHello() {
+        relay?.send(Protocol.encode(Wire.Hello(
+            roomCode = AppPrefs.roomCode,
+            deviceName = AppPrefs.deviceName,
+            role = "master",
+            maxVolume = audio.maxVolume()
+        )))
+    }
+
+    private fun startRelayStatePump() {
+        relayStatePumpJob?.cancel()
+        relayStatePumpJob = viewModelScope.launch {
+            while (isActive) {
+                relay?.send(Protocol.encode(Wire.State(
+                    deviceName = AppPrefs.deviceName,
+                    playing = false,
+                    volume = audio.volumePercent(),
+                    maxVolume = 100,
+                    brightness = audio.brightnessPercent()
+                )))
+                delay(2000)
+            }
+        }
+    }
+
+    private fun relayCmd(action: String, value: Int? = null, target: String? = null) {
+        relay?.send(Protocol.encode(Wire.Cmd(
+            action = action,
+            value = value,
+            target = target,
+            sender = AppPrefs.deviceName
+        )))
+    }
+
+    // -------- LAN client sync --------
+
     private fun syncClients(snapshot: Map<String, Peer>) {
-        // Spawn clients for new peers. Re-create if the resolved host:port
-        // changed (DHCP renewed) or the existing client isn't actually
-        // connected (the old socket may be dead after a network blip).
         for ((key, peer) in snapshot) {
+            if (key.startsWith(RELAY_PEER_PREFIX)) continue
             val existing = clients[key]
             val stale = existing != null && (
                 existing.host != peer.host || existing.port != peer.port
@@ -164,8 +297,7 @@ class SquadViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 viewModelScope.launch {
                     client.events.collect { line ->
-                        val clean = line.removePrefix("→").trim()
-                        EventLog.send(clean)
+                        EventLog.send(line.removePrefix("→").trim())
                     }
                 }
                 viewModelScope.launch {
@@ -193,7 +325,6 @@ class SquadViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
         }
-        // Remove clients for vanished peers.
         val keep = clients.keys.intersect(snapshot.keys)
         for (k in clients.keys.toList()) if (k !in keep) {
             clients.remove(k)?.stop()
@@ -206,25 +337,29 @@ class SquadViewModel(app: Application) : AndroidViewModel(app) {
     fun broadcastVolumeUp() = broadcast(Actions.VOLUME_UP, null)
     fun broadcastVolumeDown() = broadcast(Actions.VOLUME_DOWN, null)
 
-    /**
-     * Sets every slave's media volume to [percentPercent] (0..100). Master also
-     * applies the change locally so the slider always reflects reality.
-     */
     fun broadcastVolumePercent(percentPercent: Int) {
         val clamped = percentPercent.coerceIn(0, 100)
-        clients.values.forEach { it.sendCmd(Actions.VOLUME_PERCENT, clamped) }
-        // Apply locally as well.
+        if (_relayConnected.value && relay != null) {
+            relayCmd(Actions.VOLUME_PERCENT, clamped)
+        } else {
+            clients.values.forEach { it.sendCmd(Actions.VOLUME_PERCENT, clamped) }
+        }
         audio.setVolumePercent(clamped)
     }
 
     fun broadcastBrightnessPercent(percent: Int) {
         val clamped = percent.coerceIn(0, 100)
         var sent = 0
-        clients.values.forEach { c ->
-            val peer = _peers.value[c.key]
-            if (peer?.selected != false) {
-                c.sendCmd(Actions.BRIGHTNESS_PERCENT, clamped)
-                sent++
+        if (_relayConnected.value && relay != null) {
+            relayCmd(Actions.BRIGHTNESS_PERCENT, clamped)
+            sent = 1
+        } else {
+            clients.values.forEach { c ->
+                val peer = _peers.value[c.key]
+                if (peer?.selected != false) {
+                    c.sendCmd(Actions.BRIGHTNESS_PERCENT, clamped)
+                    sent++
+                }
             }
         }
         audio.setBrightnessPercent(clamped)
@@ -232,25 +367,37 @@ class SquadViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun sendBrightnessPercentTo(peerKey: String, percent: Int) {
-        clients[peerKey]?.sendCmd(Actions.BRIGHTNESS_PERCENT, percent.coerceIn(0, 100))
+        if (peerKey.startsWith(RELAY_PEER_PREFIX)) {
+            relayCmd(Actions.BRIGHTNESS_PERCENT, percent.coerceIn(0, 100))
+        } else {
+            clients[peerKey]?.sendCmd(Actions.BRIGHTNESS_PERCENT, percent.coerceIn(0, 100))
+        }
     }
 
     fun requestAppsFor(peerKey: String) {
-        clients[peerKey]?.sendCmd(Actions.LIST_APPS)
+        if (peerKey.startsWith(RELAY_PEER_PREFIX)) {
+            relayCmd(Actions.LIST_APPS)
+        } else {
+            clients[peerKey]?.sendCmd(Actions.LIST_APPS)
+        }
     }
 
     fun launchAppOn(peerKey: String, packageName: String) {
-        val c = clients[peerKey] ?: return
-        c.sendCmd(Actions.LAUNCH_APP, target = packageName)
-        relay?.send(Protocol.encode(Wire.Cmd(action = Actions.LAUNCH_APP, target = packageName)))
+        if (peerKey.startsWith(RELAY_PEER_PREFIX)) {
+            relayCmd(Actions.LAUNCH_APP, target = packageName)
+        } else {
+            clients[peerKey]?.sendCmd(Actions.LAUNCH_APP, target = packageName)
+            relayCmd(Actions.LAUNCH_APP, target = packageName)
+        }
     }
 
-    /**
-     * Sets a single slave's media volume to [percentPercent] (0..100).
-     */
     fun sendVolumePercentTo(peerKey: String, percentPercent: Int) {
         val clamped = percentPercent.coerceIn(0, 100)
-        clients[peerKey]?.sendCmd(Actions.VOLUME_PERCENT, clamped)
+        if (peerKey.startsWith(RELAY_PEER_PREFIX)) {
+            relayCmd(Actions.VOLUME_PERCENT, clamped)
+        } else {
+            clients[peerKey]?.sendCmd(Actions.VOLUME_PERCENT, clamped)
+        }
     }
 
     fun setLocalVolumePercent(percentPercent: Int) {
@@ -258,16 +405,11 @@ class SquadViewModel(app: Application) : AndroidViewModel(app) {
         EventLog.send("本机音量 → ${percentPercent.coerceIn(0, 100)}%")
     }
 
-    /** Local screen brightness (0..100). Returns 0 if WRITE_SETTINGS not granted. */
     fun localBrightnessPercent(): Int = audio.brightnessPercent()
-
     fun hasBrightnessPermission(): Boolean = audio.hasBrightnessWritePermission()
-
-    /** Returns current master local volume as percent 0..100. */
     fun localVolumePercent(): Int = audio.volumePercent()
-
-    /** Returns current master local max volume index (max slider). */
     fun localMaxVolumeIndex(): Int = audio.maxVolume()
+
     fun broadcastPlay() = broadcast(Actions.PLAY, null)
     fun broadcastPause() = broadcast(Actions.PAUSE, null)
     fun broadcastToggle() = broadcast(Actions.TOGGLE, null)
@@ -277,28 +419,19 @@ class SquadViewModel(app: Application) : AndroidViewModel(app) {
     fun broadcastUnmute() = broadcast(Actions.UNMUTE, null)
 
     fun sendTo(peerKey: String, action: String, value: Int? = null) {
-        val c = clients[peerKey] ?: return
-        c.sendCmd(action, value)
-        // Mirror over the relay too. The remote peer (across the relay)
-        // will receive the same Wire.Cmd JSON and dispatch it.
-        relay?.send(Protocol.encode(Wire.Cmd(action = action, value = value)))
+        if (peerKey.startsWith(RELAY_PEER_PREFIX)) {
+            relayCmd(action, value)
+        } else {
+            clients[peerKey]?.sendCmd(action, value)
+            relayCmd(action, value)
+        }
     }
 
     private fun broadcast(action: String, value: Int?) {
-        // Routing policy:
-        //   relay connected   ->  send ONLY via relay (peers reachable across
-        //                        the Internet are typically behind NAT; the relay
-        //                        is the only path that reaches them. Don't double
-        //                        send to LAN peers or they'll execute twice.)
-        //   relay not yet     ->  fall back to LAN (mDNS) peers. Same selection
-        //                        rules: only peers the user has ticked.
-        //   both              ->  impossible (we only set `_relayConnected` to
-        //                        true after a successful onOpen).
         if (_relayConnected.value && relay != null) {
-            relay?.send(Protocol.encode(Wire.Cmd(action = action, value = value)))
+            relayCmd(action, value)
             return
         }
-        // Fallback: LAN / direct peers.
         var sent = 0
         clients.values.forEach { c ->
             val peer = _peers.value[c.key]
@@ -325,6 +458,12 @@ class SquadViewModel(app: Application) : AndroidViewModel(app) {
     override fun onCleared() {
         super.onCleared()
         clients.values.forEach { it.stop() }
+        relay?.stop()
+        relayStatePumpJob?.cancel()
         nsd.stopDiscovery()
+    }
+
+    companion object {
+        private const val RELAY_PEER_PREFIX = "relay:"
     }
 }
