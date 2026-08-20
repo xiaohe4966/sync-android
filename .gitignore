@@ -1,0 +1,37 @@
+# Gradle
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+.kotlin/
+
+# Android Studio / IntelliJ
+.cxx/
+captures/
+.externalNativeBuild/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+
+# Output APKs
+app/build/outputs/apk/debug/*.apk
+app/build/outputs/apk/release/*.apk
+
+# Logs
+*.log
+hs_err_pid*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Keystores (NEVER commit real keys)
+*.jks
+*.keystore
+keystore.properties
+
+# Local config
+local.properties
