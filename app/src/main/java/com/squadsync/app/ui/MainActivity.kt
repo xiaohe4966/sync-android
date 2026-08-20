@@ -250,7 +250,7 @@ fun SquadScreen(vm: SquadViewModel, activity: ComponentActivity) {
                                 relayUrl.isBlank() ->
                                     "📡 命令通过：本地 mDNS 局域网"
                                 relayOn ->
-                                    "📡 命令通过：转发服务器 (wss://sync.he66.cn)"
+                                    "📡 命令通过：转发服务器 ($relayUrl)"
                                 else ->
                                     "📡 命令通过：本地 mDNS 局域网（转发服务器未连接）"
                             },

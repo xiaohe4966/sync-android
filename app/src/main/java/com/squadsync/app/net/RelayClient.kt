@@ -139,17 +139,18 @@ class RelayClient(
     private fun buildWsUrl(base: String, room: String, device: String): String {
         val trimmed = base.trim().trimEnd('/')
         android.util.Log.i("RelayClient", "buildWsUrl: input='$trimmed' len=${trimmed.length}")
-        val host = when {
-            trimmed.startsWith("wss://") -> trimmed.removePrefix("wss://")
-            trimmed.startsWith("ws://") -> trimmed.removePrefix("ws://")
-            trimmed.startsWith("https://") -> trimmed.removePrefix("https://")
-            trimmed.startsWith("http://") -> trimmed.removePrefix("http://")
-            else -> trimmed
+        // Preserve the original scheme (wss vs ws) so secure relays stay secure.
+        val (scheme, host) = when {
+            trimmed.startsWith("wss://") -> "wss" to trimmed.removePrefix("wss://")
+            trimmed.startsWith("ws://") -> "ws" to trimmed.removePrefix("ws://")
+            trimmed.startsWith("https://") -> "wss" to trimmed.removePrefix("https://")
+            trimmed.startsWith("http://") -> "ws" to trimmed.removePrefix("http://")
+            else -> "ws" to trimmed
         }
-        android.util.Log.i("RelayClient", "buildWsUrl: host='$host'")
+        android.util.Log.i("RelayClient", "buildWsUrl: scheme=$scheme host='$host'")
         val encodedRoom = java.net.URLEncoder.encode(room, "UTF-8")
         val encodedDevice = java.net.URLEncoder.encode(device, "UTF-8")
-        return "ws://$host/v1/rooms/$encodedRoom/ws?device=$encodedDevice"
+        return "$scheme://$host/v1/rooms/$encodedRoom/ws?device=$encodedDevice"
     }
 
     companion object { private const val TAG = "RelayClient" }

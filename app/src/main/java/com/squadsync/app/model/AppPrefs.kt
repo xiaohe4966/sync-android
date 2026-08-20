@@ -11,10 +11,11 @@ object AppPrefs {
     fun init(ctx: Context) {
         sp = ctx.applicationContext
             .getSharedPreferences("squadsync_prefs", Context.MODE_PRIVATE)
-        // One-time migration: if a previous build wrote an empty relayUrl
-        // (the old default), upgrade it to the hosted sync.he66.cn relay so
-        // existing users start off connected instead of LAN-only.
-        if (sp.contains("relayUrl") && sp.getString("relayUrl", "").isNullOrEmpty()) {
+        // One-time migrations:
+        // 1) Empty relayUrl -> default hosted relay.
+        // 2) Typo domain sync.he4966.cn -> correct sync.he66.cn.
+        val current = sp.getString("relayUrl", null)
+        if (current == null || current.isEmpty() || current == "wss://sync.he4966.cn") {
             sp.edit { putString("relayUrl", DEFAULT_RELAY_URL) }
         }
     }
